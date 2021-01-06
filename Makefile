@@ -14,7 +14,9 @@ RPM_ARCH=x86_64
 
 build-dev-images: build-bin
 	docker build -t ${REGISTRY}/kube-ovn:${DEV_TAG} -f dist/images/Dockerfile dist/images/
-
+	
+image:
+	docker build -t ${REGISTRY}/kube-ovn:${DEV_TAG} -f dist/images/Dockerfile dist/images/
 push-dev:
 	docker push ${REGISTRY}/kube-ovn:${DEV_TAG}
 

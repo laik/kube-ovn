@@ -29,9 +29,10 @@ RUN yum install -y  \
         hostname ethtool \
         iproute nc \
         unbound unbound-devel \
-        tcpdump ipset && yum clean all
+        tcpdump ipset \
+        iptables && yum clean all
 ARG RPM_ARCH
-RUN rpm -ivh --nodeps https://download-ib01.fedoraproject.org/pub/fedora/linux/releases/30/Everything/${RPM_ARCH}/os/Packages/i/iptables-1.8.0-5.fc30.${RPM_ARCH}.rpm
+# RUN rpm -ivh --nodeps https://download-ib01.fedoraproject.org/pub/fedora/linux/releases/30/Everything/${RPM_ARCH}/os/Packages/i/iptables-1.8.0-5.fc30.${RPM_ARCH}.rpm
 
 RUN mkdir -p /var/run/openvswitch && \
     mkdir -p /var/run/ovn && \
@@ -40,11 +41,12 @@ RUN mkdir -p /var/run/openvswitch && \
 
 ARG ARCH
 ENV CNI_VERSION=v0.8.6
-RUN curl -sSf -L --retry 5 https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${ARCH}-${CNI_VERSION}.tgz | tar -xz -C . ./loopback ./portmap
+ADD loopback .
+ADD portmap .
 
 ENV KUBE_VERSION="v1.13.2"
-RUN curl -L https://storage.googleapis.com/kubernetes-release/release/${KUBE_VERSION}/bin/linux/${ARCH}/kubectl -o /usr/bin/kubectl \
- && chmod +x /usr/bin/kubectl
+ADD kubectl /usr/bin/kubectl
+RUN chmod +x /usr/bin/kubectl
 
 RUN --mount=type=bind,target=/rpms,from=ovs-rpm,source=/rpms rpm -ivh --nodeps /rpms/*.rpm
 
