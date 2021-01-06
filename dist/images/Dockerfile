@@ -4,6 +4,7 @@ FROM centos:8 as ovs-rpm
 ARG RPM_ARCH
 ARG ARCH
 
+RUN yum install wget -y && wget -O /etc/yum.repos.d/CentOS-Base.repo http://mirrors.aliyun.com/repo/Centos-8.repo
 RUN yum install dnf-plugins-core -y && \
     yum config-manager --set-enabled PowerTools && \
     yum install python36 git wget openssl-devel gcc \
