@@ -2,6 +2,12 @@ package daemon
 
 import (
 	"fmt"
+	"net"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/Mellanox/sriovnet"
 	kubeovnv1 "github.com/alauda/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/alauda/kube-ovn/pkg/ovs"
 	"github.com/alauda/kube-ovn/pkg/util"
@@ -10,36 +16,128 @@ import (
 	goping "github.com/oilbeater/go-ping"
 	"github.com/vishvananda/netlink"
 	"k8s.io/klog"
-	"net"
-	"os/exec"
-	"strings"
-	"time"
 )
 
-func (csh cniServerHandler) configureNic(podName, podNamespace, netns, containerID, mac, ip, gateway, ingress, egress, vlanID string) error {
+func setupVethPair(containerID string, mtu int) (string, string, error) {
 	var err error
 	hostNicName, containerNicName := generateNicName(containerID)
 	// Create a veth pair, put one end to container ,the other to ovs port
 	// NOTE: DO NOT use ovs internal type interface for container.
 	// Kubernetes will detect 'eth0' nic in pod, so the nic name in pod must be 'eth0'.
 	// When renaming internal interface to 'eth0', ovs will delete and recreate this interface.
-	veth := netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: hostNicName, MTU: csh.Config.MTU}, PeerName: containerNicName}
-	defer func() {
-		// Remove veth link in case any error during creating pod network.
-		if err != nil {
-			netlink.LinkDel(&veth)
-		}
-	}()
+	veth := netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: hostNicName, MTU: mtu}, PeerName: containerNicName}
 	if err = netlink.LinkAdd(&veth); err != nil {
-		return fmt.Errorf("failed to crate veth for %s %v", podName, err)
+		if err := netlink.LinkDel(&veth); err != nil {
+			klog.Errorf("failed to delete veth %v", err)
+			return "", "", err
+		}
+		return "", "", fmt.Errorf("failed to crate veth for %v", err)
+	}
+	return hostNicName, containerNicName, nil
+}
+
+// Setup sriov interface in the pod
+// https://github.com/ovn-org/ovn-kubernetes/commit/6c96467d0d3e58cab05641293d1c1b75e5914795
+func setupSriovInterface(containerID, deviceID string, mtu int) (string, string, error) {
+	// 1. get VF netdevice from PCI
+	vfNetdevices, err := sriovnet.GetNetDevicesFromPci(deviceID)
+	if err != nil {
+		klog.Errorf("failed to get vf netdevice %s, %v", deviceID, err)
+		return "", "", err
 	}
 
+	// Make sure we have 1 netdevice per pci address
+	if len(vfNetdevices) != 1 {
+		return "", "", fmt.Errorf("failed to get one netdevice interface per %s", deviceID)
+	}
+	vfNetdevice := vfNetdevices[0]
+
+	// 2. get Uplink netdevice
+	uplink, err := sriovnet.GetUplinkRepresentor(deviceID)
+	if err != nil {
+		klog.Errorf("failed to get up %s link device, %v", deviceID, err)
+		return "", "", err
+	}
+
+	// 3. get VF index from PCI
+	vfIndex, err := sriovnet.GetVfIndexByPciAddress(deviceID)
+	if err != nil {
+		klog.Errorf("failed to get vf %s index, %v", deviceID, err)
+		return "", "", err
+	}
+
+	// 4. lookup representor
+	rep, err := sriovnet.GetVfRepresentor(uplink, vfIndex)
+	if err != nil {
+		klog.Errorf("failed to get vf %d representor, %v", vfIndex, err)
+		return "", "", err
+	}
+	oldHostRepName := rep
+
+	// 5. rename the host VF representor
+	hostNicName, _ := generateNicName(containerID)
+	if err = renameLink(oldHostRepName, hostNicName); err != nil {
+		return "", "", fmt.Errorf("failed to rename %s to %s: %v", oldHostRepName, hostNicName, err)
+	}
+
+	link, err := netlink.LinkByName(hostNicName)
+	if err != nil {
+		return "", "", err
+	}
+
+	// 6. set MTU on VF representor
+	if err = netlink.LinkSetMTU(link, mtu); err != nil {
+		return "", "", fmt.Errorf("failed to set MTU on %s: %v", hostNicName, err)
+	}
+
+	return hostNicName, vfNetdevice, nil
+}
+
+func renameLink(curName, newName string) error {
+	link, err := netlink.LinkByName(curName)
+	if err != nil {
+		return err
+	}
+
+	if err := netlink.LinkSetDown(link); err != nil {
+		return err
+	}
+	if err := netlink.LinkSetName(link, newName); err != nil {
+		return err
+	}
+	if err := netlink.LinkSetUp(link); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (csh cniServerHandler) configureNic(podName, podNamespace, netns, containerID, ifName, mac, ip, gateway, ingress, egress, vlanID, DeviceID string) error {
+	var err error
+	var hostNicName, containerNicName string
+	if DeviceID == "" {
+		hostNicName, containerNicName, err = setupVethPair(containerID, csh.Config.MTU)
+		if err != nil {
+			klog.Errorf("failed to create veth pair %v", err)
+			return err
+		}
+	} else {
+		hostNicName, containerNicName, err = setupSriovInterface(containerID, DeviceID, csh.Config.MTU)
+		if err != nil {
+			klog.Errorf("failed to create sriov interfaces %v", err)
+			return err
+		}
+	}
+
+	ipStr := util.GetIpWithoutMask(ip)
 	ifaceID := fmt.Sprintf("%s.%s", podName, podNamespace)
 	ovs.CleanDuplicatePort(ifaceID)
 	// Add veth pair host end to ovs port
-	output, err := exec.Command(
-		"ovs-vsctl", "--may-exist", "add-port", "br-int", hostNicName, "--",
-		"set", "interface", hostNicName, fmt.Sprintf("external_ids:iface-id=%s", ifaceID)).CombinedOutput()
+	output, err := ovs.Exec(ovs.MayExist, "add-port", "br-int", hostNicName, "--",
+		"set", "interface", hostNicName, fmt.Sprintf("external_ids:iface-id=%s", ifaceID),
+		fmt.Sprintf("external_ids:pod_name=%s", podName),
+		fmt.Sprintf("external_ids:pod_namespace=%s", podNamespace),
+		fmt.Sprintf("external_ids:ip=%s", ipStr))
 	if err != nil {
 		return fmt.Errorf("add nic to ovs failed %v: %q", err, output)
 	}
@@ -49,10 +147,10 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, netns, container
 	if err != nil {
 		return fmt.Errorf("failed to parse mac %s %v", macAddr, err)
 	}
-	if err = configureHostNic(hostNicName, vlanID, macAddr); err != nil {
+	if err = configureHostNic(hostNicName, vlanID); err != nil {
 		return err
 	}
-	if err = ovs.SetPodBandwidth(podName, podNamespace, ingress, egress); err != nil {
+	if err = ovs.SetInterfaceBandwidth(fmt.Sprintf("%s.%s", podName, podNamespace), ingress, egress); err != nil {
 		return err
 	}
 
@@ -60,16 +158,16 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, netns, container
 	if err != nil {
 		return fmt.Errorf("failed to open netns %q: %v", netns, err)
 	}
-	if err = configureContainerNic(containerNicName, ip, gateway, macAddr, podNS, csh.Config.MTU); err != nil {
+	if err = configureContainerNic(containerNicName, ifName, ip, gateway, macAddr, podNS, csh.Config.MTU); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (csh cniServerHandler) deleteNic(podName, podNamespace, containerID string) error {
+func (csh cniServerHandler) deleteNic(podName, podNamespace, containerID, deviceID string) error {
 	hostNicName, _ := generateNicName(containerID)
 	// Remove ovs port
-	output, err := exec.Command("ovs-vsctl", "--if-exists", "--with-iface", "del-port", "br-int", hostNicName).CombinedOutput()
+	output, err := ovs.Exec(ovs.IfExists, "--with-iface", "del-port", "br-int", hostNicName)
 	if err != nil {
 		return fmt.Errorf("failed to delete ovs port %v, %q", err, output)
 	}
@@ -78,18 +176,19 @@ func (csh cniServerHandler) deleteNic(podName, podNamespace, containerID string)
 		return err
 	}
 
-	hostLink, err := netlink.LinkByName(hostNicName)
-	if err != nil {
-		// If link already not exists, return quietly
-		if _, ok := err.(netlink.LinkNotFoundError); ok {
-			return nil
+	if deviceID == "" {
+		hostLink, err := netlink.LinkByName(hostNicName)
+		if err != nil {
+			// If link already not exists, return quietly
+			if _, ok := err.(netlink.LinkNotFoundError); ok {
+				return nil
+			}
+			return fmt.Errorf("find host link %s failed %v", hostNicName, err)
 		}
-		return fmt.Errorf("find host link %s failed %v", hostNicName, err)
+		if err = netlink.LinkDel(hostLink); err != nil {
+			return fmt.Errorf("delete host link %s failed %v", hostLink, err)
+		}
 	}
-	if err = netlink.LinkDel(hostLink); err != nil {
-		return fmt.Errorf("delete host link %s failed %v", hostLink, err)
-	}
-
 	return nil
 }
 
@@ -97,15 +196,12 @@ func generateNicName(containerID string) (string, string) {
 	return fmt.Sprintf("%s_h", containerID[0:12]), fmt.Sprintf("%s_c", containerID[0:12])
 }
 
-func configureHostNic(nicName, vlanID string, macAddr net.HardwareAddr) error {
+func configureHostNic(nicName, vlanID string) error {
 	hostLink, err := netlink.LinkByName(nicName)
 	if err != nil {
 		return fmt.Errorf("can not find host nic %s %v", nicName, err)
 	}
 
-	if err = netlink.LinkSetHardwareAddr(hostLink, macAddr); err != nil {
-		return fmt.Errorf("can not set mac address to host nic %s %v", nicName, err)
-	}
 	if hostLink.Attrs().OperState != netlink.OperUp {
 		if err = netlink.LinkSetUp(hostLink); err != nil {
 			return fmt.Errorf("can not set host nic %s up %v", nicName, err)
@@ -124,7 +220,7 @@ func configureHostNic(nicName, vlanID string, macAddr net.HardwareAddr) error {
 	return nil
 }
 
-func configureContainerNic(nicName, ipAddr, gateway string, macAddr net.HardwareAddr, netns ns.NetNS, mtu int) error {
+func configureContainerNic(nicName, ifName string, ipAddr, gateway string, macAddr net.HardwareAddr, netns ns.NetNS, mtu int) error {
 	containerLink, err := netlink.LinkByName(nicName)
 	if err != nil {
 		return fmt.Errorf("can not find container nic %s %v", nicName, err)
@@ -134,13 +230,11 @@ func configureContainerNic(nicName, ipAddr, gateway string, macAddr net.Hardware
 		return fmt.Errorf("failed to link netns %v", err)
 	}
 
-	// TODO: use github.com/containernetworking/plugins/pkg/ipam.ConfigureIface to refactor this logical
 	return ns.WithNetNSPath(netns.Path(), func(_ ns.NetNS) error {
-		// Container nic name MUST be 'eth0', otherwise kubelet will recreate the pod
-		if err = netlink.LinkSetName(containerLink, "eth0"); err != nil {
+		if err = netlink.LinkSetName(containerLink, ifName); err != nil {
 			return err
 		}
-		if util.CheckProtocol(ipAddr) == kubeovnv1.ProtocolIPv6 {
+		if util.CheckProtocol(ipAddr) == kubeovnv1.ProtocolDual || util.CheckProtocol(ipAddr) == kubeovnv1.ProtocolIPv6 {
 			// For docker version >=17.x the "none" network will disable ipv6 by default.
 			// We have to enable ipv6 here to add v6 address and gateway.
 			// See https://github.com/containernetworking/cni/issues/531
@@ -155,7 +249,7 @@ func configureContainerNic(nicName, ipAddr, gateway string, macAddr net.Hardware
 			}
 		}
 
-		if err = configureNic("eth0", ipAddr, macAddr, mtu); err != nil {
+		if err = configureNic(ifName, ipAddr, macAddr, mtu); err != nil {
 			return err
 		}
 
@@ -176,17 +270,37 @@ func configureContainerNic(nicName, ipAddr, gateway string, macAddr net.Hardware
 				Dst:       defaultNet,
 				Gw:        net.ParseIP(gateway),
 			})
+		case kubeovnv1.ProtocolDual:
+			gws := strings.Split(gateway, ",")
+			_, defaultNet, _ := net.ParseCIDR("0.0.0.0/0")
+			err = netlink.RouteAdd(&netlink.Route{
+				LinkIndex: containerLink.Attrs().Index,
+				Scope:     netlink.SCOPE_UNIVERSE,
+				Dst:       defaultNet,
+				Gw:        net.ParseIP(gws[0]),
+			})
+			if err != nil {
+				return fmt.Errorf("config v4 gateway failed %v", err)
+			}
+
+			_, defaultNet, _ = net.ParseCIDR("::/0")
+			err = netlink.RouteAdd(&netlink.Route{
+				LinkIndex: containerLink.Attrs().Index,
+				Scope:     netlink.SCOPE_UNIVERSE,
+				Dst:       defaultNet,
+				Gw:        net.ParseIP(gws[1]),
+			})
 		}
 
 		if err != nil {
 			return fmt.Errorf("config gateway failed %v", err)
 		}
 
-		return waiteNetworkReady(gateway)
+		return waitNetworkReady(gateway)
 	})
 }
 
-func waiteNetworkReady(gateway string) error {
+func waitNetworkReady(gateway string) error {
 	pinger, err := goping.NewPinger(gateway)
 	if err != nil {
 		return fmt.Errorf("failed to init pinger, %v", err)

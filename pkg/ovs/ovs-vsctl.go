@@ -2,14 +2,87 @@ package ovs
 
 import (
 	"fmt"
-	"k8s.io/klog"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
+
+	"k8s.io/klog"
 )
 
 // Glory belongs to openvswitch/ovn-kubernetes
 // https://github.com/openvswitch/ovn-kubernetes/blob/master/go-controller/pkg/util/ovs.go
+
+// SetInterfaceBandwidth set ingress/egress qos for given pod
+func SetInterfaceBandwidth(iface, ingress, egress string) error {
+	ingressMPS, _ := strconv.Atoi(ingress)
+	ingressKPS := ingressMPS * 1000
+	interfaceList, err := ovsFind("interface", "name", fmt.Sprintf("external-ids:iface-id=%s", iface))
+	if err != nil {
+		return err
+	}
+
+	for _, ifName := range interfaceList {
+		// ingress_policing_rate is in Kbps
+		err := ovsSet("interface", ifName, fmt.Sprintf("ingress_policing_rate=%d", ingressKPS), fmt.Sprintf("ingress_policing_burst=%d", ingressKPS*10/8))
+		if err != nil {
+			return err
+		}
+
+		egressMPS, _ := strconv.Atoi(egress)
+		egressBPS := egressMPS * 1000 * 1000
+
+		qosList, err := ovsFind("qos", "_uuid", fmt.Sprintf("external-ids:iface-id=%s", iface))
+		if err != nil {
+			return err
+		}
+		if egressBPS > 0 {
+			if len(qosList) == 0 {
+				qos, err := ovsCreate("qos", "type=linux-htb", fmt.Sprintf("other-config:max-rate=%d", egressBPS), fmt.Sprintf("external-ids:iface-id=%s", iface))
+				if err != nil {
+					return err
+				}
+				err = ovsSet("port", ifName, fmt.Sprintf("qos=%s", qos))
+				if err != nil {
+					return err
+				}
+			} else {
+				for _, qos := range qosList {
+					klog.Infof("qos %s already exists", qos)
+					if err := ovsSet("qos", qos, fmt.Sprintf("other-config:max-rate=%d", egressBPS)); err != nil {
+						return err
+					}
+				}
+			}
+		} else {
+			if err = ovsClear("port", ifName, "qos"); err != nil {
+				return err
+			}
+			for _, qos := range qosList {
+				if err := ovsDestroy("qos", qos); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func Exec(args ...string) (string, error) {
+	start := time.Now()
+	args = append([]string{"--timeout=30"}, args...)
+	output, err := exec.Command("ovs-vsctl", args...).CombinedOutput()
+	elapsed := float64((time.Since(start)) / time.Millisecond)
+	klog.V(4).Infof("command ovs-vsctl %s in %vms", strings.Join(args, " "), elapsed)
+	if err != nil || elapsed > 500 {
+		klog.Warning("ovs-vsctl command error or took too long")
+		klog.Warningf("ovs-vsctl %s in %vms", strings.Join(args, " "), elapsed)
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to run 'ovs-vsctl %s': %v\n  %q", strings.Join(args, " "), err, output)
+	}
+	return trimCommandOutput(output), nil
+}
 
 func ovsExec(args ...string) (string, error) {
 	args = append([]string{"--timeout=30"}, args...)

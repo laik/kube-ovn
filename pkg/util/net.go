@@ -99,3 +99,11 @@ func AddressCount(network *net.IPNet) float64 {
 	}
 	return math.Pow(2, float64(bits-prefixLen)) - 2
 }
+
+func GetIpWithoutMask(ipStr string) string {
+	var ips []string
+	for _, ip := range strings.Split(ipStr, ",") {
+		ips = append(ips, strings.Split(ip, "/")[0])
+	}
+	return strings.Join(ips, ",")
+}

@@ -4,10 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/alauda/kube-ovn/pkg/util"
 	"net"
 	"runtime"
 	"strings"
+
+	"github.com/alauda/kube-ovn/pkg/util"
 
 	kubeovnv1 "github.com/alauda/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/alauda/kube-ovn/pkg/request"
@@ -116,7 +117,9 @@ func cmdDel(args *skel.CmdArgs) error {
 		PodNamespace: podNamespace,
 		ContainerID:  args.ContainerID,
 		NetNs:        args.Netns,
+		IfName:       args.IfName,
 		Provider:     netConf.Provider,
+		DeviceID:     netConf.DeviceID,
 	})
 }
 
@@ -130,6 +133,7 @@ type netConf struct {
 	ServerSocket string    `json:"server_socket"`
 	Provider     string    `json:"provider"`
 	IPAM         *ipamConf `json:"ipam"`
+	DeviceID     string    `json:"deviceID"`
 }
 
 func loadNetConf(bytes []byte) (*netConf, string, error) {
