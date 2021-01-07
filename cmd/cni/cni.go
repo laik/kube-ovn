@@ -52,7 +52,9 @@ func cmdAdd(args *skel.CmdArgs) error {
 		PodNamespace: podNamespace,
 		ContainerID:  args.ContainerID,
 		NetNs:        args.Netns,
+		IfName:       args.IfName,
 		Provider:     netConf.Provider,
+		DeviceID:     netConf.DeviceID,
 	})
 	if err != nil {
 		return err

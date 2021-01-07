@@ -13,9 +13,11 @@ RUN yum install dnf-plugins-core -y && \
     checkpolicy selinux-policy-devel unbound unbound-devel gcc-c++ \
     desktop-file-utils graphviz groff python3-sphinx -y
 COPY build.sh /root/build.sh
+ADD ovs ovs
+ADD ovn ovn
 RUN bash /root/build.sh
 RUN mkdir /rpms/ && \
-    cp /ovs/rpm/rpmbuild/RPMS/${RPM_ARCH}/* /ovn/rpm/rpmbuild/RPMS/${RPM_ARCH}/* /rpms && \
+    cp /ovs/rpm/rpmbuild/RPMS/x86_64/* /ovn/rpm/rpmbuild/RPMS/x86_64/* /rpms && \
     cd /rpms && rm -f *debug* *docker* *vtep* *ipsec*
 
 
